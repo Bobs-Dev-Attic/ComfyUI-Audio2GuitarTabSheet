@@ -4,6 +4,7 @@ Detects monophonic pitches in an audio clip and renders an ASCII guitar tab.
 """
 
 import logging
+import os
 
 import librosa
 import numpy as np
@@ -33,7 +34,6 @@ TUNINGS = {
 }
 
 MAX_FRET = 12                 # highest fret considered for mapping
-MAX_AUDIO_SECONDS = 60        # safety limit (seconds)
 MAX_MEDIAN_KERNEL_DELTA = 30  # simplicity=1.0 → kernel size 1 + MAX_MEDIAN_KERNEL_DELTA
 
 
@@ -57,6 +57,140 @@ def _filter_short_notes(midi_notes: np.ndarray, min_hops: int) -> np.ndarray:
         else:
             i += 1
     return result
+
+
+def _to_mono_float32(waveform) -> np.ndarray:
+    """
+    Convert ComfyUI AUDIO waveform input to a contiguous mono float32 numpy array.
+
+    Expected waveform shapes:
+      - torch.Tensor(B, C, T)
+      - torch.Tensor(C, T)
+      - torch.Tensor(T,)
+      - numpy equivalents of the above
+    """
+    if isinstance(waveform, torch.Tensor):
+        x = waveform.detach().to("cpu", dtype=torch.float32)
+        if x.ndim == 3:
+            # (B, C, T) -> mix batch and channels to mono
+            x = x.mean(dim=0).mean(dim=0)
+        elif x.ndim == 2:
+            # (C, T) -> average channels
+            x = x.mean(dim=0)
+        elif x.ndim != 1:
+            raise ValueError(f"Unsupported tensor waveform shape: {tuple(x.shape)}")
+        return np.ascontiguousarray(x.numpy(), dtype=np.float32)
+
+    x = np.asarray(waveform, dtype=np.float32)
+    if x.ndim == 3:
+        x = x.mean(axis=0).mean(axis=0)
+    elif x.ndim == 2:
+        x = x.mean(axis=0)
+    elif x.ndim != 1:
+        raise ValueError(f"Unsupported ndarray waveform shape: {x.shape}")
+    return np.ascontiguousarray(x, dtype=np.float32)
+
+
+def _select_hop_length(num_samples: int, sample_rate: int) -> int:
+    """
+    Choose hop length adaptively so long recordings remain practical.
+    """
+    duration_s = num_samples / sample_rate
+    if duration_s <= 60:
+        return 512
+    if duration_s <= 180:
+        return 1024
+    if duration_s <= 600:
+        return 2048
+    return 4096
+
+
+def _format_memory_report(
+    audio_np: np.ndarray,
+    f0: np.ndarray,
+    f0_smooth: np.ndarray,
+    midi_notes: np.ndarray,
+    hop_length: int,
+    sample_rate: int,
+) -> str:
+    """
+    Return a concise, human-readable report of memory usage and processing shape.
+    """
+    duration_s = len(audio_np) / sample_rate
+    total_bytes = audio_np.nbytes + f0.nbytes + f0_smooth.nbytes + midi_notes.nbytes
+    report = [
+        "[Memory Usage]",
+        f"duration_sec: {duration_s:.2f}",
+        f"hop_length: {hop_length}",
+        f"audio_mb: {audio_np.nbytes / (1024 * 1024):.2f}",
+        f"f0_mb: {f0.nbytes / (1024 * 1024):.2f}",
+        f"f0_smooth_mb: {f0_smooth.nbytes / (1024 * 1024):.2f}",
+        f"midi_mb: {midi_notes.nbytes / (1024 * 1024):.2f}",
+        f"tracked_total_mb: {total_bytes / (1024 * 1024):.2f}",
+    ]
+    available_mem_bytes = _get_available_memory_bytes()
+    if available_mem_bytes is not None:
+        report.append(f"available_system_mb: {available_mem_bytes / (1024 * 1024):.2f}")
+    return "\n".join(report)
+
+
+def _get_available_memory_bytes():
+    """
+    Best-effort system available memory lookup.
+    """
+    try:
+        import psutil  # optional dependency
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+
+    # Linux fallback
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        pass
+
+    # POSIX fallback (may not be available on all systems)
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int):
+            return int(pages * page_size)
+    except Exception:
+        pass
+
+    return None
+
+
+def _serialize_midi_data(midi_notes: np.ndarray, hop_length: int, sample_rate: int) -> str:
+    """
+    Serialize MIDI contour as event runs:
+    start_sec,duration_sec,midi
+    """
+    if midi_notes.size == 0:
+        return ""
+
+    rows = ["start_sec,duration_sec,midi"]
+    start = 0
+    current = int(midi_notes[0])
+    for idx in range(1, len(midi_notes) + 1):
+        at_end = idx == len(midi_notes)
+        value = None if at_end else int(midi_notes[idx])
+        if at_end or value != current:
+            duration_hops = idx - start
+            start_sec = (start * hop_length) / sample_rate
+            duration_sec = (duration_hops * hop_length) / sample_rate
+            rows.append(f"{start_sec:.4f},{duration_sec:.4f},{current}")
+            if not at_end:
+                start = idx
+                current = value
+    return "\n".join(rows)
 
 
 def _snap_to_grid(
@@ -199,7 +333,9 @@ class MonophonicGuitarTabber:
     Outputs
     -------
     TAB_TEXT   : multi-line ASCII guitar tab string
-    UI_DISPLAY : same string, for display in a Text widget
+    UI_DISPLAY : tab + memory usage summary, for display in a Text widget
+    MEMORY_USAGE: memory usage summary text
+    MIDI_DATA  : serialized MIDI event runs (CSV-like text)
     """
 
     @classmethod
@@ -230,8 +366,8 @@ class MonophonicGuitarTabber:
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("TAB_TEXT", "UI_DISPLAY")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("TAB_TEXT", "UI_DISPLAY", "MEMORY_USAGE", "MIDI_DATA")
     FUNCTION = "transcribe"
     CATEGORY = "audio"
     OUTPUT_NODE = True
@@ -247,41 +383,28 @@ class MonophonicGuitarTabber:
         # 1.  Extract a mono float32 numpy array from the ComfyUI AUDIO dict.
         #     ComfyUI AUDIO format: {"waveform": Tensor(B, C, T), "sample_rate": int}
         # ------------------------------------------------------------------
-        waveform = audio["waveform"]
-        sample_rate: int = audio["sample_rate"]
+        waveform = audio.get("waveform")
+        sample_rate = int(audio.get("sample_rate", 0))
 
-        if isinstance(waveform, torch.Tensor):
-            # (B, C, T) → squeeze batch → average channels → (T,)
-            audio_np = (
-                waveform.squeeze(0).mean(dim=0).cpu().numpy().astype(np.float32)
-            )
-        else:
-            audio_np = (
-                np.asarray(waveform, dtype=np.float32).squeeze(0).mean(axis=0)
-            )
+        if waveform is None:
+            raise ValueError("audio['waveform'] is required.")
+        if sample_rate <= 0:
+            raise ValueError("audio['sample_rate'] must be a positive integer.")
 
-        # ------------------------------------------------------------------
-        # 2.  Safety / memory check – truncate if longer than 60 seconds.
-        # ------------------------------------------------------------------
-        max_samples = int(MAX_AUDIO_SECONDS * sample_rate)
-        if len(audio_np) > max_samples:
-            logger.warning(
-                "[MonophonicGuitarTabber] Audio exceeds %ds (%.1fs). "
-                "Truncating to prevent RAM/VRAM spikes.",
-                MAX_AUDIO_SECONDS,
-                len(audio_np) / sample_rate,
-            )
-            audio_np = audio_np[:max_samples]
+        audio_np = _to_mono_float32(waveform)
+        if audio_np.size == 0:
+            raise ValueError("Audio waveform is empty.")
 
         # ------------------------------------------------------------------
-        # 3.  Silence gate.
+        # 2.  Silence gate.
         # ------------------------------------------------------------------
         audio_np[np.abs(audio_np) < threshold] = 0.0
 
         # ------------------------------------------------------------------
-        # 4.  Fundamental-frequency estimation (pYIN).
+        # 3.  Fundamental-frequency estimation (pYIN).
+        #     Uses adaptive hop_length for long-form audio.
         # ------------------------------------------------------------------
-        hop_length = 512
+        hop_length = _select_hop_length(len(audio_np), sample_rate)
         f0, voiced_flag, _voiced_probs = librosa.pyin(
             audio_np,
             fmin=float(librosa.note_to_hz("E2")),
@@ -294,7 +417,7 @@ class MonophonicGuitarTabber:
         f0 = np.where(np.isnan(f0), 0.0, f0)
 
         # ------------------------------------------------------------------
-        # 5.  Simplicity-based median filter on the f0 contour.
+        # 4.  Simplicity-based median filter on the f0 contour.
         #     simplicity 0 → kernel 1 (identity),  1 → kernel 1 + MAX_MEDIAN_KERNEL_DELTA.
         # ------------------------------------------------------------------
         kernel_size = max(1, int(1 + simplicity * MAX_MEDIAN_KERNEL_DELTA))
@@ -309,7 +432,7 @@ class MonophonicGuitarTabber:
         f0_smooth[~voiced_flag] = 0.0
 
         # ------------------------------------------------------------------
-        # 6.  Convert f0 → MIDI note numbers.
+        # 5.  Convert f0 → MIDI note numbers.
         #     MIDI = 12 · log₂(f / 440) + 69
         # ------------------------------------------------------------------
         midi_notes = np.zeros(len(f0_smooth), dtype=int)
@@ -320,7 +443,7 @@ class MonophonicGuitarTabber:
             ).astype(int)
 
         # ------------------------------------------------------------------
-        # 7.  Simplicity > 0.8 → drop notes shorter than 200 ms.
+        # 6.  Simplicity > 0.8 → drop notes shorter than 200 ms.
         # ------------------------------------------------------------------
         if simplicity > 0.8:
             hop_duration_s = hop_length / sample_rate
@@ -328,13 +451,23 @@ class MonophonicGuitarTabber:
             midi_notes = _filter_short_notes(midi_notes, min_hops)
 
         # ------------------------------------------------------------------
-        # 8.  Snap to rhythmic grid.
+        # 7.  Snap to rhythmic grid.
         # ------------------------------------------------------------------
         midi_notes = _snap_to_grid(midi_notes, simplicity, sample_rate, hop_length)
 
         # ------------------------------------------------------------------
-        # 9.  Render ASCII tab.
+        # 8.  Render ASCII tab + memory report + MIDI data.
         # ------------------------------------------------------------------
         tab_text = _generate_tab(midi_notes, tuning)
+        memory_text = _format_memory_report(
+            audio_np=audio_np,
+            f0=f0,
+            f0_smooth=f0_smooth,
+            midi_notes=midi_notes,
+            hop_length=hop_length,
+            sample_rate=sample_rate,
+        )
+        midi_data_text = _serialize_midi_data(midi_notes, hop_length, sample_rate)
+        ui_display = f"{tab_text}\n\n{memory_text}"
 
-        return (tab_text, tab_text)
+        return (tab_text, ui_display, memory_text, midi_data_text)
